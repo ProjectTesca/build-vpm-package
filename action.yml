@@ -1,0 +1,111 @@
+name: Build VPM package
+description: Build VPM manifest.json, ZIP, and Unity package without Unity.
+
+inputs:
+  package-name:
+    description: 対象 VPM パッケージ名。マニフェスト候補が 1 件だけの場合は省略できる。
+    required: false
+    default: ""
+  manifest-search-path:
+    description: VPMPackageManifest を検索するプロジェクト内の開始ディレクトリ。
+    required: false
+    default: Assets
+  output-directory:
+    description: manifest.json、ZIP、.unitypackage を出力するディレクトリ。
+    required: false
+    default: build/vpm
+  repository-private:
+    description: 非公開リポジトリなら true。ZIP の公開 URL には安全なプレースホルダーを使う。
+    required: false
+    default: "false"
+
+outputs:
+  package-name:
+    description: 変換した manifest.json に記載された VPM パッケージ名。
+    value: ${{ steps.package.outputs.name }}
+  version:
+    description: 変換した manifest.json に記載されたパッケージのバージョン。
+    value: ${{ steps.package.outputs.version }}
+  display-name:
+    description: 変換した manifest.json に記載されたパッケージの表示名。
+    value: ${{ steps.package.outputs.displayName }}
+  tag:
+    description: リリース作成に使用する「パッケージ名-vバージョン」形式のタグ。
+    value: ${{ steps.package.outputs.tag }}
+  manifest-path:
+    description: 生成した VPM 用 manifest.json のパス。
+    value: ${{ inputs.output-directory }}/manifest.json
+  zip-path:
+    description: 生成した VPM 配布用 ZIP ファイルのパス。
+    value: ${{ inputs.output-directory }}/${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}.zip
+  unitypackage-path:
+    description: 生成した Unity 用 .unitypackage ファイルのパス。
+    value: ${{ inputs.output-directory }}/${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}.unitypackage
+
+runs:
+  using: composite
+  steps:
+    # 既に Bun があるセルフホストランナーでは、セットアップを省略する。
+    - id: bun-check
+      name: Check Bun
+      shell: bash
+      run: |
+        if command -v bun >/dev/null 2>&1; then
+          echo "available=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "available=false" >> "$GITHUB_OUTPUT"
+        fi
+    # GitHub-hosted runner など Bun がない環境だけで導入する。
+    - name: Setup Bun
+      if: steps.bun-check.outputs.available != 'true'
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+    # 対象 ScriptableObject を 1 件に確定して、後続ステップへパスを渡す。
+    - id: manifest
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        PACKAGE_NAME: ${{ inputs.package-name }}
+        SEARCH_PATH: ${{ inputs.manifest-search-path }}
+      run: |
+        manifest_path="$(bun "$ACTION_PATH/find-vpm-package-manifest.ts" "$PACKAGE_NAME" "$SEARCH_PATH")"
+        echo "path=$manifest_path" >> "$GITHUB_OUTPUT"
+    # Unity の ScriptableObject を VPM / UPM 形式の package.json へ変換する。
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MANIFEST_ASSET: ${{ steps.manifest.outputs.path }}
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+      run: mkdir -p "$OUTPUT_DIRECTORY" && bun "$ACTION_PATH/vpm-package-manifest-to-json.ts" "$MANIFEST_ASSET" --out "$OUTPUT_DIRECTORY/manifest.json"
+    # ファイル名とリリースタグに使う値を検証して出力する。
+    - id: package
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        EXPECTED_PACKAGE_NAME: ${{ inputs.package-name }}
+        MANIFEST_PATH: ${{ inputs.output-directory }}/manifest.json
+      run: bun "$ACTION_PATH/write-github-output-from-json.ts" "$MANIFEST_PATH"
+    # .meta 一覧から GUID ベースの .unitypackage を作成する。
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MANIFEST_PATH: ${{ inputs.output-directory }}/manifest.json
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+        PACKAGE_NAME: ${{ steps.package.outputs.name }}
+        VERSION: ${{ steps.package.outputs.version }}
+      run: bun "$ACTION_PATH/unity-package-files-from-json.ts" "$MANIFEST_PATH" > "$OUTPUT_DIRECTORY/unity-package-files.txt" && bun "$ACTION_PATH/create-unity-package.ts" "$OUTPUT_DIRECTORY/unity-package-files.txt" "$OUTPUT_DIRECTORY/$PACKAGE_NAME-$VERSION.unitypackage"
+    # VPM の規約に合わせて ZIP 用の配置へ変換して圧縮する。
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MANIFEST_PATH: ${{ inputs.output-directory }}/manifest.json
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+        PACKAGE_NAME: ${{ steps.package.outputs.name }}
+        VERSION: ${{ steps.package.outputs.version }}
+        TAG: ${{ steps.package.outputs.tag }}
+        REPOSITORY_PRIVATE: ${{ inputs.repository-private }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        if [ "$REPOSITORY_PRIVATE" = "true" ]; then release_url="https://example.invalid/vpm/$PACKAGE_NAME-$VERSION.zip"; else release_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$PACKAGE_NAME-$VERSION.zip"; fi
+        bun "$ACTION_PATH/stage-vpm-package.ts" "$MANIFEST_PATH" "$OUTPUT_DIRECTORY/staged" "$release_url"
+        (cd "$OUTPUT_DIRECTORY/staged" && zip -qr "../$PACKAGE_NAME-$VERSION.zip" .)
